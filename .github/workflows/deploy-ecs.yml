@@ -20,9 +20,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ECS_HOST: 106.14.193.227
-  ECS_PORT: "22"
-  ECS_USER: mannix
+  ECS_HOST: ${{ secrets.ECS_HOST }}
+  ECS_PORT: ${{ secrets.ECS_PORT }}
+  ECS_USER: ${{ secrets.ECS_USER }}
   REMOTE_APP_DIR: /home/mannix/apps
 
 jobs:
