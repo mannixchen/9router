@@ -1,0 +1,310 @@
+name: Deploy 9router to ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit SHA to deploy
+        required: false
+        default: master
+      keep_releases:
+        description: Number of ECS releases to keep
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-9router-ecs
+  cancel-in-progress: false
+
+env:
+  ECS_HOST: 106.14.193.227
+  ECS_PORT: "22"
+  ECS_USER: mannix
+  REMOTE_APP_DIR: /home/mannix/apps
+
+jobs:
+  deploy:
+    name: Build artifact and deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build standalone app
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+          NEXT_TELEMETRY_DISABLED=1 NODE_ENV=production npm run build
+
+      - name: Package release
+        id: package
+        run: |
+          set -euo pipefail
+          full_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=8 HEAD)"
+          release_name="9router-${GITHUB_RUN_NUMBER}-${short_sha}"
+          release_dir="dist/${release_name}"
+          mkdir -p "${release_dir}/.next"
+
+          cp -a .next/standalone/. "${release_dir}/"
+          cp -a .next/static "${release_dir}/.next/static"
+          if [ -d public ]; then
+            cp -a public "${release_dir}/public"
+          fi
+          if [ -d open-sse ]; then
+            cp -a open-sse "${release_dir}/open-sse"
+          fi
+          if [ -d src/mitm ]; then
+            mkdir -p "${release_dir}/src"
+            cp -a src/mitm "${release_dir}/src/mitm"
+          fi
+          if [ -d node_modules/node-forge ]; then
+            mkdir -p "${release_dir}/node_modules"
+            cp -a node_modules/node-forge "${release_dir}/node_modules/node-forge"
+          fi
+
+          cat > "${release_dir}/REVISION" <<META
+          ref=${{ inputs.ref }}
+          commit=${full_sha}
+          github_run_id=${GITHUB_RUN_ID}
+          github_run_number=${GITHUB_RUN_NUMBER}
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          META
+
+          archive="${release_name}.tar.gz"
+          tar -czf "${archive}" -C dist "${release_name}"
+          echo "release_name=${release_name}" >> "$GITHUB_OUTPUT"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "commit=${full_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.release_name }}
+          path: ${{ steps.package.outputs.archive }}
+          retention-days: 14
+
+      - name: Configure SSH
+        env:
+          ECS_SSH_KEY: ${{ secrets.ECS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ECS_SSH_KEY}" ]; then
+            echo "::error::Missing repository secret ECS_SSH_KEY"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${ECS_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          for attempt in 1 2 3; do
+            if ssh-keyscan -p "${ECS_PORT}" -H "${ECS_HOST}" >> ~/.ssh/known_hosts 2>/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Failed to scan ECS SSH host key"
+          exit 1
+
+      - name: Upload release to ECS
+        env:
+          RELEASE_NAME: ${{ steps.package.outputs.release_name }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          remote_incoming="${REMOTE_APP_DIR}/9router-shared/incoming"
+          remote_archive="${remote_incoming}/${RELEASE_NAME}.tar.gz"
+          ssh -p "${ECS_PORT}" -o IdentitiesOnly=yes "${ECS_USER}@${ECS_HOST}" "mkdir -p '${remote_incoming}'"
+          scp -P "${ECS_PORT}" -o IdentitiesOnly=yes "${ARCHIVE}" "${ECS_USER}@${ECS_HOST}:${remote_archive}"
+          echo "REMOTE_ARCHIVE=${remote_archive}" >> "$GITHUB_ENV"
+
+      - name: Activate release on ECS
+        env:
+          RELEASE_NAME: ${{ steps.package.outputs.release_name }}
+          KEEP_RELEASES: ${{ inputs.keep_releases }}
+        run: |
+          set -euo pipefail
+          ssh -p "${ECS_PORT}" -o IdentitiesOnly=yes "${ECS_USER}@${ECS_HOST}" \
+            "RELEASE_NAME='${RELEASE_NAME}' REMOTE_ARCHIVE='${REMOTE_ARCHIVE}' KEEP_RELEASES='${KEEP_RELEASES}' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          APP_BASE=/home/mannix/apps
+          DEPLOY="${APP_BASE}/9router-deploy"
+          RELEASES="${APP_BASE}/9router-releases"
+          SHARED="${APP_BASE}/9router-shared"
+          RUNTIME="${APP_BASE}/9router-runtime"
+          NODE_BIN=/home/mannix/node/bin
+          RELEASE_DIR="${RELEASES}/${RELEASE_NAME}"
+
+          case "${KEEP_RELEASES}" in
+            ''|*[!0-9]*) KEEP_RELEASES=5 ;;
+          esac
+
+          mkdir -p "${DEPLOY}" "${RELEASES}" "${SHARED}/logs" "${SHARED}/incoming"
+          if [ ! -f "${SHARED}/.env" ] && [ -f "${RUNTIME}/.env" ]; then
+            cp "${RUNTIME}/.env" "${SHARED}/.env"
+          fi
+          if [ ! -f "${SHARED}/.env" ]; then
+            echo "missing runtime env: ${SHARED}/.env" >&2
+            exit 1
+          fi
+
+          cat > "${DEPLOY}/run-9router.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          SHARED=/home/mannix/apps/9router-shared
+          RUNTIME=/home/mannix/apps/9router-runtime
+          NODE_BIN=/home/mannix/node/bin
+          PID_FILE="${SHARED}/9router.pid"
+          LOG_DIR="${SHARED}/logs"
+          NODE="${NODE_BIN}/node"
+          if [ ! -x "${NODE}" ]; then
+            NODE="$(command -v node)"
+          fi
+          mkdir -p "${LOG_DIR}"
+          if [ ! -e "${RUNTIME}" ]; then
+            echo "runtime path missing: ${RUNTIME}" >&2
+            exit 1
+          fi
+          if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+            exit 0
+          fi
+          cd "${RUNTIME}"
+          set -a
+          . "${SHARED}/.env"
+          set +a
+          export PATH="${NODE_BIN}:$PATH"
+          export NODE_ENV=production
+          export HOSTNAME=127.0.0.1
+          nohup "${NODE}" "${RUNTIME}/server.js" >> "${LOG_DIR}/9router.out" 2>> "${LOG_DIR}/9router.err" &
+          echo $! > "${PID_FILE}"
+          SCRIPT
+
+          cat > "${DEPLOY}/stop-9router.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          PID_FILE=/home/mannix/apps/9router-shared/9router.pid
+          if [ ! -f "${PID_FILE}" ]; then
+            exit 0
+          fi
+          PID="$(cat "${PID_FILE}")"
+          if kill -0 "${PID}" 2>/dev/null; then
+            kill "${PID}" || true
+            for _ in $(seq 1 20); do
+              if ! kill -0 "${PID}" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+            if kill -0 "${PID}" 2>/dev/null; then
+              kill -9 "${PID}" || true
+            fi
+          fi
+          rm -f "${PID_FILE}"
+          SCRIPT
+
+          cat > "${DEPLOY}/ensure-9router.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DEPLOY=/home/mannix/apps/9router-deploy
+          if curl -fsS http://127.0.0.1:20128/api/health >/dev/null 2>&1; then
+            exit 0
+          fi
+          "${DEPLOY}/stop-9router.sh" >/dev/null 2>&1 || true
+          "${DEPLOY}/run-9router.sh" >/dev/null 2>&1
+          SCRIPT
+          chmod +x "${DEPLOY}"/*.sh
+
+          ( crontab -l 2>/dev/null || true ) | awk '
+            $0 !~ /9router-runtime\/run-9router\.sh/ &&
+            $0 !~ /9router-runtime\/ensure-9router\.sh/ &&
+            $0 !~ /9router-deploy\/run-9router\.sh/ &&
+            $0 !~ /9router-deploy\/ensure-9router\.sh/ { print }
+          ' > /tmp/9router.cron
+          {
+            cat /tmp/9router.cron
+            echo '@reboot /home/mannix/apps/9router-deploy/run-9router.sh >/dev/null 2>&1'
+            echo '* * * * * /home/mannix/apps/9router-deploy/ensure-9router.sh >/dev/null 2>&1'
+          } | crontab -
+          rm -f /tmp/9router.cron
+
+          stop_pid_file() {
+            local pid_file="$1"
+            if [ ! -f "${pid_file}" ]; then
+              return 0
+            fi
+            local pid
+            pid="$(cat "${pid_file}")"
+            if kill -0 "${pid}" 2>/dev/null; then
+              kill "${pid}" || true
+              sleep 2
+              if kill -0 "${pid}" 2>/dev/null; then
+                kill -9 "${pid}" || true
+              fi
+            fi
+            rm -f "${pid_file}"
+          }
+
+          previous_target=""
+          if [ -e "${RUNTIME}" ]; then
+            previous_target="$(readlink -f "${RUNTIME}" || true)"
+          fi
+
+          "${DEPLOY}/stop-9router.sh" >/dev/null 2>&1 || true
+          stop_pid_file "${RUNTIME}/9router.pid" || true
+          pgrep -f "${RUNTIME}/server.js" | xargs -r kill || true
+
+          if [ -d "${RUNTIME}" ] && [ ! -L "${RUNTIME}" ]; then
+            legacy_target="${RUNTIME}.legacy-$(date +%Y%m%d-%H%M%S)"
+            mv "${RUNTIME}" "${legacy_target}"
+            previous_target="${legacy_target}"
+          fi
+
+          rm -rf "${RELEASE_DIR}"
+          tar -xzf "${REMOTE_ARCHIVE}" -C "${RELEASES}"
+          test -f "${RELEASE_DIR}/server.js"
+          ln -sfn "${RELEASE_DIR}" "${RUNTIME}"
+          "${DEPLOY}/run-9router.sh"
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:20128/api/health >/dev/null 2>&1; then
+              current_target="$(readlink -f "${RUNTIME}" || true)"
+              find "${RELEASES}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | awk -v keep="${KEEP_RELEASES}" 'NR > keep { print $2 }' | while read -r old_release; do
+                [ "${old_release}" = "${current_target}" ] && continue
+                [ -n "${previous_target}" ] && [ "${old_release}" = "${previous_target}" ] && continue
+                rm -rf "${old_release}"
+              done
+              rm -f "${REMOTE_ARCHIVE}"
+              echo "deployed_release=${RELEASE_DIR}"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "health check failed, rolling back" >&2
+          "${DEPLOY}/stop-9router.sh" >/dev/null 2>&1 || true
+          if [ -n "${previous_target}" ] && [ -d "${previous_target}" ]; then
+            ln -sfn "${previous_target}" "${RUNTIME}"
+            "${DEPLOY}/run-9router.sh" >/dev/null 2>&1 || true
+          fi
+          exit 1
+          REMOTE
+
+      - name: Print deployed revision
+        run: |
+          echo "Deployed ${{ steps.package.outputs.commit }} as ${{ steps.package.outputs.release_name }}"
